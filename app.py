@@ -1,5 +1,5 @@
 """
-app.py - RH 代理服务
+app.py - RH 代理服务（后厨）
 职责：
   1. 接收 ComfyUI 节点的请求
   2. 调用 New API 验证 Key + 扣费
@@ -220,13 +220,16 @@ def health():
     return jsonify({"status": "ok", "service": "rh-proxy"})
 
 
-@app.route("/openapi/v2/media/upload/binary", methods=["POST"])
-def upload_image():
+@app.route("/openapi/v2/<path:endpoint>", methods=["POST"])
+def handle_request(endpoint):
     """
-    接收 ComfyUI 节点上传的图片
-    → 验证 Key
-    → 转发给 RH
+    统一处理所有 /openapi/v2/* 请求：
+    - media/upload/binary → 上传图片
+    - query               → 查询任务状态（不扣费）
+    - 其他                → 提交任务（扣费）
     """
+    logger.info(f"收到请求: /openapi/v2/{endpoint}")
+
     # 从请求头获取用户 Key
     user_key = _extract_key(request)
     if not user_key:
@@ -237,117 +240,66 @@ def upload_image():
     if not auth["valid"]:
         return jsonify({"code": 401, "message": auth.get("reason", "Key 无效")}), 401
 
-    # 检查余额
-    if auth["balance"] < COST_PER_IMAGE:
-        return jsonify({
-            "code": 402,
-            "message": f"余额不足（当前 ${auth['balance']:.2f}，需要 ${COST_PER_IMAGE:.2f}）"
-        }), 402
+    # ── 上传图片 ──────────────────────────────────────────────────
+    if endpoint == "media/upload/binary":
+        if auth["balance"] < COST_PER_IMAGE:
+            return jsonify({
+                "code": 402,
+                "message": f"余额不足（当前 ${auth['balance']:.2f}，需要 ${COST_PER_IMAGE:.2f}）"
+            }), 402
+        try:
+            file = request.files.get("file")
+            if not file:
+                return jsonify({"code": 400, "message": "缺少 file 字段"}), 400
+            download_url = rh_upload_image(file.read(), file.filename or "image.png")
+            logger.info(f"用户 {auth['username']} 上传图片成功")
+            return jsonify({"code": 0, "data": {"download_url": download_url}})
+        except Exception as e:
+            logger.error(f"上传失败: {e}")
+            return jsonify({"code": 500, "message": str(e)}), 500
 
-    # 转发上传给 RH
-    try:
-        file = request.files.get("file")
-        if not file:
-            return jsonify({"code": 400, "message": "缺少 file 字段"}), 400
-
-        download_url = rh_upload_image(file.read(), file.filename or "image.png")
-        logger.info(f"用户 {auth['username']} 上传图片成功")
-
-        # 返回和 RH 一样的格式，ComfyUI 节点不需要改代码
-        return jsonify({
-            "code": 0,
-            "data": {"download_url": download_url}
-        })
-
-    except Exception as e:
-        logger.error(f"上传失败: {e}")
-        return jsonify({"code": 500, "message": str(e)}), 500
-
-
-@app.route("/openapi/v2/<path:endpoint>", methods=["POST"])
-def submit_task(endpoint):
-    """
-    接收 ComfyUI 节点的任务提交请求
-    → 验证 Key
-    → 扣费
-    → 转发给 RH
-    注意：/openapi/v2/query 也走这里，需要单独处理
-    """
-    # query 接口单独处理（不扣费，只查询）
+    # ── 查询任务状态（不扣费）────────────────────────────────────
     if endpoint == "query":
-        return proxy_query()
+        try:
+            body    = request.get_json(force=True) or {}
+            task_id = body.get("taskId")
+            if not task_id:
+                return jsonify({"code": 400, "message": "缺少 taskId"}), 400
+            resp = requests.post(
+                f"{RH_BASE_URL}/openapi/v2/query",
+                headers={
+                    "Authorization": f"Bearer {RH_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"taskId": task_id},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return jsonify(resp.json())
+        except Exception as e:
+            logger.error(f"查询任务失败: {e}")
+            return jsonify({"code": 500, "message": str(e)}), 500
 
-    # 从请求头获取用户 Key
-    user_key = _extract_key(request)
-    if not user_key:
-        return jsonify({"code": 401, "message": "缺少 Authorization Header"}), 401
-
-    # 验证 Key 和余额
-    auth = verify_key_and_get_balance(user_key)
-    if not auth["valid"]:
-        return jsonify({"code": 401, "message": auth.get("reason", "Key 无效")}), 401
-
+    # ── 提交任务（扣费）──────────────────────────────────────────
     if auth["balance"] < COST_PER_IMAGE:
         return jsonify({
             "code": 402,
             "message": f"余额不足（当前 ${auth['balance']:.2f}，需要 ${COST_PER_IMAGE:.2f}）"
         }), 402
-
-    # 提交任务给 RH
     try:
-        body = request.get_json(force=True) or {}
+        body    = request.get_json(force=True) or {}
         task_id = rh_submit_task(endpoint, body)
-
-        # 扣费
         deducted = deduct_balance(user_key, COST_PER_IMAGE, endpoint, endpoint)
         if not deducted:
             logger.warning(f"扣费失败，但任务已提交: {task_id}")
-
         logger.info(f"用户 {auth['username']} 提交任务 {task_id}，扣费 ${COST_PER_IMAGE}")
-
-        # 返回和 RH 一样的格式
         return jsonify({"taskId": task_id, "status": "RUNNING"})
-
     except Exception as e:
         logger.error(f"提交任务失败: {e}")
         return jsonify({"code": 500, "message": str(e)}), 500
 
 
-def proxy_query():
-    """
-    轮询任务状态（不扣费，直接转发）
-    验证 Key 有效即可
-    """
-    user_key = _extract_key(request)
-    if not user_key:
-        return jsonify({"code": 401, "message": "缺少 Authorization Header"}), 401
 
-    auth = verify_key_and_get_balance(user_key)
-    if not auth["valid"]:
-        return jsonify({"code": 401, "message": auth.get("reason", "Key 无效")}), 401
-
-    try:
-        body    = request.get_json(force=True) or {}
-        task_id = body.get("taskId")
-        if not task_id:
-            return jsonify({"code": 400, "message": "缺少 taskId"}), 400
-
-        # 直接查一次，不等待（ComfyUI 节点自己会轮询）
-        resp = requests.post(
-            f"{RH_BASE_URL}/openapi/v2/query",
-            headers={
-                "Authorization": f"Bearer {RH_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"taskId": task_id},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return jsonify(resp.json())
-
-    except Exception as e:
-        logger.error(f"查询任务失败: {e}")
-        return jsonify({"code": 500, "message": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────────
