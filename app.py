@@ -51,27 +51,51 @@ def verify_key_and_get_balance(user_key: str) -> dict:
     返回：{ "valid": bool, "balance": float, "user_id": int, "token_id": int }
     """
     try:
+        url = f"{NEW_API_URL}/api/user/self"
+        logger.info(f"验证 Key，请求地址: {url}")
+
         resp = requests.get(
-            f"{NEW_API_URL}/api/user/self",
-            headers={"Authorization": f"Bearer {user_key}"},
-            timeout=10,
+            url,
+            headers={
+                "Authorization": f"Bearer {user_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
         )
+
+        logger.info(f"New API 响应状态码: {resp.status_code}")
+        logger.info(f"New API 响应内容: {resp.text[:300]}")
+
         if resp.status_code == 401:
             return {"valid": False, "reason": "Key 无效或已过期"}
 
-        data = resp.json()
+        if resp.status_code != 200:
+            return {"valid": False, "reason": f"New API 返回异常状态码: {resp.status_code}"}
+
+        try:
+            data = resp.json()
+        except Exception:
+            # 返回的不是 JSON，可能是 HTML 错误页
+            logger.error(f"New API 返回非 JSON 内容: {resp.text[:200]}")
+            return {"valid": False, "reason": "New API 返回格式错误"}
+
         if data.get("success") is False:
             return {"valid": False, "reason": data.get("message", "验证失败")}
 
         user_data = data.get("data", {})
-        balance = user_data.get("quota", 0) / 500000  # New API 内部单位换算为美元
+        # New API 内部额度单位，无限额度时 quota 可能为负数或极大值
+        quota = user_data.get("quota", 0)
+        balance = quota / 500000 if quota > 0 else 999999
 
         return {
             "valid": True,
             "balance": balance,
             "user_id": user_data.get("id"),
-            "username": user_data.get("username"),
+            "username": user_data.get("username", "unknown"),
         }
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"无法连接到 New API ({NEW_API_URL}): {e}")
+        return {"valid": False, "reason": f"无法连接到验证服务器: {str(e)}"}
     except Exception as e:
         logger.error(f"验证 Key 失败: {e}")
         return {"valid": False, "reason": f"服务器错误: {str(e)}"}
