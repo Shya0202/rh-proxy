@@ -47,11 +47,12 @@ POLL_TIMEOUT  = int(os.environ.get("POLL_TIMEOUT", "600"))
 
 def verify_key_and_get_balance(user_key: str) -> dict:
     """
-    用用户的 Key 去 New API 查询：Key 是否有效、余额是否足够
-    返回：{ "valid": bool, "balance": float, "user_id": int, "token_id": int }
+    用用户的 Key 去 New API 查询令牌额度
+    使用 /api/usage/token 接口（专门为令牌设计）
+    返回：{ "valid": bool, "balance": float, "username": str }
     """
     try:
-        url = f"{NEW_API_URL}/api/user/self"
+        url = f"{NEW_API_URL}/api/usage/token"
         logger.info(f"验证 Key，请求地址: {url}")
 
         resp = requests.get(
@@ -75,23 +76,26 @@ def verify_key_and_get_balance(user_key: str) -> dict:
         try:
             data = resp.json()
         except Exception:
-            # 返回的不是 JSON，可能是 HTML 错误页
             logger.error(f"New API 返回非 JSON 内容: {resp.text[:200]}")
             return {"valid": False, "reason": "New API 返回格式错误"}
 
-        if data.get("success") is False:
-            return {"valid": False, "reason": data.get("message", "验证失败")}
+        # /api/usage/token 返回格式：{ "code": true, "data": { "total_available": ..., "unlimited_quota": ... } }
+        if not data.get("code"):
+            return {"valid": False, "reason": data.get("message", "令牌验证失败")}
 
-        user_data = data.get("data", {})
-        # New API 内部额度单位，无限额度时 quota 可能为负数或极大值
-        quota = user_data.get("quota", 0)
-        balance = quota / 500000 if quota > 0 else 999999
+        token_data = data.get("data", {})
+        unlimited   = token_data.get("unlimited_quota", False)
+        available   = token_data.get("total_available", 0)
+        name        = token_data.get("name", "unknown")
+
+        # 无限额度或有剩余额度都算有效
+        balance = 999999 if unlimited else available / 500000
 
         return {
             "valid": True,
             "balance": balance,
-            "user_id": user_data.get("id"),
-            "username": user_data.get("username", "unknown"),
+            "unlimited": unlimited,
+            "username": name,
         }
     except requests.exceptions.ConnectionError as e:
         logger.error(f"无法连接到 New API ({NEW_API_URL}): {e}")
