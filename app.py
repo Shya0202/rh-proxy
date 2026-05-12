@@ -1,5 +1,5 @@
 """
-app.py - RH 代理服务（后厨）
+app.py - RH 代理服务
 职责：
   1. 接收 ComfyUI 节点的请求
   2. 调用 New API 验证 Key + 扣费
